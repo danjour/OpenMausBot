@@ -11,11 +11,13 @@ pnpm lint
 ```
 
 The test launches its own temporary server through `launchVerificationServer`,
-creates fixture bots and tasks, then stops that exact child before seeding
-Full Access into its disposable saved state. It restarts against the same
-temporary home with a restricted environment. No production grant bypass or
-live application data is used. Both server processes are stopped before the
-fixture is removed.
+creates fixture bots and tasks, then stops that exact child, keeps only the
+inverse per-task seed in its disposable saved state, and restarts against the
+same temporary home with `OMB_OPERATOR_FULL_ACCESS_BOT_IDS` set to the
+Chief's bot ID. That restart exercises the real operator startup grant, not a
+fixture write or HTTP grant. No production grant bypass or live application
+data is used. Both server processes are stopped before the fixture is
+removed.
 
 The repository's scripted Claude fixture calls the real injected agents MCP
 proxy. Its tool choices and final narration are deterministic, not evidence
@@ -23,6 +25,10 @@ of a real provider's planning quality or authentication.
 
 ## What it checks
 
+- The startup grant refuses malformed or duplicate IDs, and refuses a list
+  granted Chief's existing threads all read Full after restart, a later
+  thread inherits Full, and the unrelated peer stays Ask. HTTP task, thread,
+  and bot routes still refuse Full, so the grant is startup-only.
 - One Full Access turn updates the Chief's profile, creates a monthly cron
   routine with an explicit timezone, saves an enabled skill, creates a named
   Research team and specialist, and updates the active Chief's own setup.
@@ -34,7 +40,8 @@ of a real provider's planning quality or authentication.
   card or extra setup continuation appears, and new specialists retain Ask.
 - Real peer coordination succeeds with `approvePeerComms` enabled. Its one
   downstream summary is expected; unrelated setup continuations are not.
-- An explicit Ask sibling retains four pending reviews even though the bot
+- An explicit Ask sibling, restored through the task API after the grant
+  covers every thread, retains four pending reviews even though the bot
   default is Full. Conversely, an explicit Full thread applies its profile
   change while the bot default remains Ask.
 - An expired turn token is refused, and Full does not authorize changes to
@@ -59,5 +66,6 @@ removed after the run.
 
 The first recipe verifies server and MCP behavior, not the rendered review UI,
 desktop permission-grant gesture, or real-model instruction following. The
-test starts from fixture-only saved grants; it does not test granting Full
+Chief grant comes from the real operator startup environment; only the
+inverse per-task seed is fixture state. It does not test granting Full
 Access through the desktop.

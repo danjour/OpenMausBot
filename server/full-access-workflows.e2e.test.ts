@@ -1,5 +1,6 @@
 // Real server + injected MCP tools; only the provider's planning is scripted.
-// Persisted Full grants below belong exclusively to this stopped fixture.
+// Chief Full comes from the real operator startup grant below (Clonador-only
+// self-hosted Docker path); only the inverse per-task seed is fixture state.
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, openSync, readFileSync, writeFileSync } from "node:fs";
@@ -8,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
 import { launchVerificationServer, runControlOmb } from "../scripts/control-omb.ts";
 import { waitForExit } from "./testing/cleanup.ts";
+import { approvalModeFor } from "../shared/approval-mode.ts";
 
 it("applies requested Full Access workflows through MCP without duplicate approvals, while exact Ask tasks still wait", async () => {
   const fixture = await launchVerificationServer({}, undefined, undefined, undefined, undefined, { scripted: true });
@@ -44,6 +46,8 @@ it("applies requested Full Access workflows through MCP without duplicate approv
       expectedActiveLeafId: (await api("GET", `/api/threads/${threadId}/messages?limit=1`)).activeLeafId } : undefined;
     const accepted = guardedInput ? await api("POST", `/api/bots/${bot.id}/messages/guarded`, guardedInput, 202)
       : await cli("send", "--bot", bot.id, "--task", threadId, "--text", text);
+    const settled = await cli("wait", "--bot", bot.id, "--task", threadId, "--timeout", "60");
+    if (providerTurns().length === before) throw new Error(JSON.stringify({ settled, messages: await messages(threadId) }));
     const expectedTurns = options.resumeReply ? 3 : 1; // caller, requested teammate, caller's one summary
     await expect.poll(() => providerTurns().length, { timeout: 25_000 }).toBe(before + expectedTurns);
     expect((await cli("wait", "--bot", bot.id, "--task", threadId, "--timeout", "25")).status).toBe(options.pending ? "needs-user" : "settled");
@@ -70,7 +74,7 @@ it("applies requested Full Access workflows through MCP without duplicate approv
     }
     return caller;
   };
-  const restart = async () => {
+  const restart = async (grantBotIds?: string) => {
     const env: NodeJS.ProcessEnv = {};
     for (const [key, value] of Object.entries(process.env)) {
       if (["SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "LANG", "LC_ALL", "TZ"].includes(key.toUpperCase()) && value) env[key.toUpperCase()] = value;
@@ -83,6 +87,7 @@ it("applies requested Full Access workflows through MCP without duplicate approv
       TEMP: join(dataDir, "tmp"), TMP: join(dataDir, "tmp"), TMPDIR: join(dataDir, "tmp"),
       OMB_PORT: new URL(url).port, OMB_WEBHOOK_PORT: String(Number(new URL(url).port) + 1), PATH: dirname(process.execPath),
       FAKE_CLAUDE_MODE: "happy", FAKE_CLAUDE_DUMP: fixture.fixtureDumpPath,
+      ...(grantBotIds === undefined ? {} : { OMB_OPERATOR_FULL_ACCESS_BOT_IDS: grantBotIds }),
     });
     const log = openSync(logPath, "a", 0o600);
     restarted = spawn(process.execPath, ["--experimental-strip-types", fileURLToPath(new URL("./index.ts", import.meta.url))], {
@@ -95,6 +100,33 @@ it("applies requested Full Access workflows through MCP without duplicate approv
       catch { return false; }
     }, { timeout: 20_000 }).toBe(true);
   };
+  const expectBootFails = async (grantValue: string, expectedLog: RegExp) => {
+    const env: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (["SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "LANG", "LC_ALL", "TZ"].includes(key.toUpperCase()) && value) env[key.toUpperCase()] = value;
+    }
+    Object.assign(env, {
+      HOME: dataDir, USERPROFILE: dataDir, OMB_DATA_DIR: dataDir,
+      APPDATA: join(dataDir, "AppData", "Roaming"), LOCALAPPDATA: join(dataDir, "AppData", "Local"),
+      XDG_CONFIG_HOME: join(dataDir, ".config"), XDG_CACHE_HOME: join(dataDir, ".cache"),
+      XDG_DATA_HOME: join(dataDir, ".local", "share"), HERMES_HOME: join(dataDir, ".hermes"),
+      TEMP: join(dataDir, "tmp"), TMP: join(dataDir, "tmp"), TMPDIR: join(dataDir, "tmp"),
+      OMB_PORT: new URL(url).port, OMB_WEBHOOK_PORT: String(Number(new URL(url).port) + 1), PATH: dirname(process.execPath),
+      FAKE_CLAUDE_MODE: "happy", FAKE_CLAUDE_DUMP: fixture.fixtureDumpPath,
+      OMB_OPERATOR_FULL_ACCESS_BOT_IDS: grantValue,
+    });
+    const logStart = readFileSync(logPath, "utf8").length;
+    const log = openSync(logPath, "a", 0o600);
+    const child = spawn(process.execPath, ["--experimental-strip-types", fileURLToPath(new URL("./index.ts", import.meta.url))], {
+      cwd: fileURLToPath(new URL("..", import.meta.url)), env, stdio: ["ignore", log, log],
+    });
+    closeSync(log);
+    await expect.poll(() => child.exitCode !== null || child.signalCode !== null, { timeout: 20_000 }).toBe(true);
+    expect(child.exitCode).not.toBe(0);
+    await waitForExit(child);
+    expect(await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(1000) }).then(response => response.ok, () => false)).toBe(false);
+    await expect.poll(() => readFileSync(logPath, "utf8").slice(logStart), { timeout: 10_000 }).toMatch(expectedLog);
+  };
   try {
     const chief = (await cli("new-bot", "--name", "Clive", "--section", "Operations")).bot;
     await api("PATCH", `/api/bots/${chief.id}`, { chiefOfStaff: true, approvePeerComms: true });
@@ -103,32 +135,47 @@ it("applies requested Full Access workflows through MCP without duplicate approv
     const inverse = (await cli("new-bot", "--name", "Thread Full", "--section", "Private")).bot;
     const modelSelection = chief.modelSelection;
     await api("PATCH", "/api/config", { features: { skillAuthoring: true } });
-
-    // This is fixture setup, not a production grant endpoint or bypass flag.
-    // Stop the exact owned server before changing its disposable persisted data.
+    // Chief Full comes from the real operator startup grant below, never HTTP
+    // or a fixture write: stop the owned server, keep only the inverse
+    // per-task fixture seed, and restart with the grant for chief.id.
     await waitForExit(fixture.child, { signal: "SIGTERM" });
-    const savedBots = JSON.parse(readFileSync(join(dataDir, "bots.json"), "utf8"));
-    const savedChief = savedBots.find((bot: any) => bot.id === chief.id);
-    savedChief.approvalMode = "full"; savedChief.autoApprove = false;
-    for (const task of savedChief.tasks) {
-      task.approvalMode = task.threadId === ask.threadId ? "ask" : "full";
-      task.autoApprove = false;
-    }
-    const savedInverse = savedBots.find((bot: any) => bot.id === inverse.id);
-    savedInverse.approvalMode = "ask"; savedInverse.autoApprove = false;
-    savedInverse.tasks.find((task: any) => task.threadId === inverse.activeTaskId).approvalMode = "full";
-    writeFileSync(join(dataDir, "bots.json"), JSON.stringify(savedBots, null, 2));
-    await restart();
+    const savedInverseBots: { id: string; approvalMode?: string; autoApprove?: boolean; tasks: { threadId: string; approvalMode?: string }[] }[] = JSON.parse(readFileSync(join(dataDir, "bots.json"), "utf8"));
+    const savedInverse = savedInverseBots.find((bot) => bot.id === inverse.id);
+    savedInverse!.approvalMode = "ask"; savedInverse!.autoApprove = false;
+    savedInverse!.tasks.find((task) => task.threadId === inverse.activeTaskId)!.approvalMode = "full";
+    writeFileSync(join(dataDir, "bots.json"), JSON.stringify(savedInverseBots, null, 2));
+    // Negative startup cases run against the stopped port: malformed IDs,
+    // duplicates, and one unknown bot each refuse boot before any write.
+    await expectBootFails("not a bot id!", /must contain unique bot IDs/);
+    await expectBootFails(`${chief.id},${chief.id}`, /must contain unique bot IDs/);
+    await expectBootFails(`${chief.id},missing-bot`, /Operator Full Access refused for bot missing-bot/);
+    expect(approvalModeFor(JSON.parse(readFileSync(join(dataDir, "bots.json"), "utf8"))
+      .find((bot) => bot.id === chief.id))).toBe("ask");
+    await restart(chief.id);
     expect((await api("GET", "/api/health")).capabilities).toMatchObject({ guardedFullAccess: 1 });
     expect((await api("GET", "/api/health")).capabilities.sharedWorkspaceFullAccess).toBeUndefined();
+    const grantedChief = (await bots()).find((bot) => bot.id === chief.id);
+    expect(grantedChief).toMatchObject({ approvalMode: "full", autoApprove: false });
+    expect(grantedChief.tasks.every((task) => task.approvalMode === "full" && task.autoApprove === false)).toBe(true);
+    // A future thread inherits the granted Full default.
+    const future = (await api("POST", `/api/bots/${chief.id}/tasks`, { title: "Future inherits Full" }, 201)).task;
+    expect(future).toMatchObject({ approvalMode: "full", autoApprove: false });
+    expect(approvalModeFor((await bots()).find((bot) => bot.id === peer.id))).toBe("ask");
+    // The grant covers every existing thread, so downgrade the explicit Ask
+    // sibling back through the task API; HTTP still cannot grant Full.
+    await api("PATCH", `/api/bots/${chief.id}/tasks/${ask.threadId}`, { approvalMode: "ask" });
+    expect((await bots()).find((bot) => bot.id === chief.id).tasks.find((task) => task.threadId === ask.threadId))
+      .toMatchObject({ approvalMode: "ask", autoApprove: false });
+    await api("PATCH", `/api/bots/${chief.id}/tasks/${ask.threadId}`, { approvalMode: "full" }, 403);
     const request = { threadId: chief.activeTaskId, text: "WRONG_MODE_MUST_NOT_RUN", sendId: randomUUID(),
       expectedActiveLeafId: (await api("GET", `/api/threads/${chief.activeTaskId}/messages?limit=1`)).activeLeafId };
     expect((await api("POST", `/api/bots/${chief.id}/messages/guarded`, request, 409)).code).toBe("guarded_permissions");
     expect((await api("POST", `/api/bots/${chief.id}/messages/guarded`, { ...request, threadId: ask.threadId, expectedApprovalMode: "full", expectedActiveLeafId: null }, 409)).code).toBe("guarded_permissions");
     await api("POST", `/api/bots/${chief.id}/tasks`, { title: "No operator grant", approvalMode: "full" }, 403);
+    await api("PATCH", `/api/bots/${peer.id}`, { approvalMode: "full" }, 403);
     expect(providerTurns()).toHaveLength(0);
-    evidence.push({ setup: "fixture-only persisted modes", restartedPid: restarted?.pid, modes: [
-      { botId: chief.id, default: "full", fullTask: chief.activeTaskId, askTask: ask.threadId },
+    evidence.push({ setup: "operator startup grant", restartedPid: restarted?.pid, modes: [
+      { botId: chief.id, default: "full", fullTask: chief.activeTaskId, askTask: ask.threadId, futureTask: future.threadId },
       { botId: inverse.id, default: "ask", fullTask: inverse.activeTaskId },
     ] });
 
@@ -239,6 +286,7 @@ it("applies requested Full Access workflows through MCP without duplicate approv
     const persisted = JSON.parse(readFileSync(join(dataDir, "bots.json"), "utf8"));
     expect(persisted.find((bot: any) => bot.id === chief.id)).toMatchObject({ title: "Monthly reporting Chief", approvalMode: "full" });
     expect(persisted.find((bot: any) => bot.id === chief.id).tasks.find((task: any) => task.threadId === ask.threadId).approvalMode).toBe("ask");
+    expect(persisted.find((bot: any) => bot.id === chief.id).tasks.find((task: any) => task.threadId === future.threadId).approvalMode).toBe("full");
     expect(persisted.find((bot: any) => bot.id === inverse.id)).toMatchObject({ title: "Applied from Full task", approvalMode: "ask" });
     expect(persisted.find((bot: any) => bot.id === inverse.id).tasks.find((task: any) => task.threadId === inverse.activeTaskId).approvalMode).toBe("full");
     // the delegated pair thread stays Full on disk; Ada's own default does not move
@@ -266,7 +314,7 @@ it("applies requested Full Access workflows through MCP without duplicate approv
     expect((await api("GET", pendingRoute)).messages[0]).toMatchObject({ id: pendingReceipt.message.id, requestPending: true });
     await waitForExit(restarted, { signal: "SIGTERM" });
     const beforeRestart = providerTurns().length;
-    await restart();
+    await restart(chief.id);
     const recovered = await api("GET", pendingRoute);
     expect(recovered).toMatchObject({ phase: "untracked", activeTurnId: null, executionId: null });
     expect(recovered.messages.some((message: any) => message.turnTerminal && message.text === "Assigned the restart check" && message.turnSucceeded)).toBe(true);

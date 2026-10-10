@@ -3751,6 +3751,27 @@ const store = new Store(
   (selection) => withNewBotEffort(selection, cfg.newBots?.effort, registry.get(selection.instanceId)?.adapter.capabilities.effortLevels),
   (instanceId) => registry.cliTarget(instanceId)?.driverKind,
 );
+// Operator-owned startup environment, never an HTTP grant or a bot tool.
+// ponytail: explicit bot IDs only; use the desktop for interactive grants.
+if (process.env.OMB_OPERATOR_FULL_ACCESS_BOT_IDS !== undefined) {
+  if (DESKTOP_MANAGED || HOSTED_WORKSPACE || CLOUD_HOME) throw new Error("Operator Full Access is only available on a self-hosted server");
+  const ids = process.env.OMB_OPERATOR_FULL_ACCESS_BOT_IDS.split(",").map(id => id.trim());
+  if (!ids.length || ids.some(id => !/^[\w-]{1,128}$/.test(id)) || new Set(ids).size !== ids.length) {
+    throw new Error("OMB_OPERATOR_FULL_ACCESS_BOT_IDS must contain unique bot IDs");
+  }
+  const targets = ids.map(id => {
+    const bot = store.bot(id);
+    if (!bot || bot.approvalGrant || !supportsApprovalMode(bot.modelSelection, "full") ||
+        store.tasks(id).some(task => !supportsApprovalMode(task.modelSelection ?? bot.modelSelection, "full"))) {
+      throw new Error(`Operator Full Access refused for bot ${id}: missing bot, pending grant or unsupported provider`);
+    }
+    return bot;
+  });
+  for (const bot of targets) {
+    store.setAllThreadApprovalMode(bot.id, "full");
+    console.warn(`Operator granted Full Access to ${bot.name} (${bot.id}), including all existing and future threads`);
+  }
+}
 const teamComputers = new TeamComputers(join(DATA_DIR, "team-computers.json"), ENVIRONMENT_ID);
 let followupsReady = false;
 const sendSequencer = new SendSequencer();
