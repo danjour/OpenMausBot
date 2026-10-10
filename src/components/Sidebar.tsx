@@ -2589,6 +2589,10 @@ export function Sidebar({ open, onClose, collapseToIcons = false }: {
                   sectionGroupItems,
                 )
               : undefined;
+            // Project section: user section with ≥1 group and no active search
+            // shows only teams (groups). Individual bots stay hidden here but
+            // keep working (delegation, threads, groups intact).
+            const isProjectSection = Boolean(sectionName) && sectionGroupItems.length > 0 && !q;
             return (
               <div
                 key={id}
@@ -2633,7 +2637,7 @@ export function Sidebar({ open, onClose, collapseToIcons = false }: {
                   className="mx-3 mb-1 self-start rounded bg-raised/50 px-2 py-0.5 text-[10px] text-ink-secondary hover:text-ink">{t("task.queued")} · {queued.length}</button>}
                 {!collapsed && (
                   <>
-                    {sectionChiefItems.map((bot) => <BotListItem key={bot.id} {...botRow(bot)} />)}
+                    {!isProjectSection && sectionChiefItems.map((bot) => <BotListItem key={bot.id} {...botRow(bot)} />)}
                     {sectionGroupItems.map((group) => (
                       <GroupListItem
                         key={group.id}
@@ -2644,14 +2648,14 @@ export function Sidebar({ open, onClose, collapseToIcons = false }: {
                         onMenu={setRoomMenu}
                       />
                     ))}
-                    {id === PINNED_SECTION_ID ? (
+                    {!isProjectSection && (id === PINNED_SECTION_ID ? (
                       <PinnedBotRoster
                         bots={sectionBotItems}
                         density={density}
                         circles={pinnedCircles}
                         row={botRow}
                       />
-                    ) : sectionBotItems.map((bot) => <BotListItem key={bot.id} {...botRow(bot)} />)}
+                    ) : sectionBotItems.map((bot) => <BotListItem key={bot.id} {...botRow(bot)} />))}
                     {!remoteClient && sectionName && layoutInteractive && (
                       <button onClick={() => setMoveToTeam(sectionName)} aria-label={t(state.bots.some(bot => !bot.hidden && bot.section?.trim() === sectionName) ? "team.manageBotsIn" : "team.addBotsTo", { name: sectionName })}
                         className="mx-3 my-1 flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[12px] text-ink-secondary hover:bg-raised hover:text-ink">
