@@ -71,6 +71,7 @@ import { commandReceipt } from "./commands.ts";
 import { buildTurnDigest, coverageForDriver, digestPromptLine, renderDigest, toolEvidence } from "./digest.ts";
 import { appendDecision, bindDecisionRetention, boundRetentionDays, decisionRetentionDays, decisionsCsv, flushDecisionLog, pruneDecisions, readDecisionRange, readDecisions, withDecisionActor, type DecisionActor } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
+import { groupYoloActive, groupYoloVerdict, parseGroupYoloPolicy, type GroupYoloRequest } from "./group-yolo.ts";
 import {
   ATTACHMENTS_DIR,
   attachmentExists,
@@ -121,7 +122,7 @@ import { createDataRoutes } from "./data/routes.ts";
 import { DataSheetRegistry } from "./data/sheet.ts";
 import { DataFailure } from "./data/types.ts";
 import { TeamComputers, teamComputerAssignment, teamComputerCreate, teamComputerOwner, type TeamComputerRecord } from "./team-computers.ts";
-import { isEffortLevel, type BotVisibility, type CardAnswerer, type ResolvedSender, type SteerQueueReason, type WireBot, type WireGroup, type WireTask } from "../shared/wire.ts";
+import { isEffortLevel, type BotVisibility, type CardAnswerer, type GroupYoloPolicy, type ResolvedSender, type SteerQueueReason, type WireBot, type WireGroup, type WireTask } from "../shared/wire.ts";
 import { isPersistentQuestionCard, QUESTION_DISMISS_MESSAGE, shouldSettleRequestCard } from "../shared/ask-question.ts";
 import { parseToolScope, toolScopeWidens } from "../shared/tool-scope.ts";
 import type { TeamComputersPayload } from "../shared/team-computer.ts";
@@ -4865,16 +4866,19 @@ function updateChannel(groupId: string, value: unknown): GroupRecord {
 
   const existing = store.group(groupId);
   if (!existing) throw Object.assign(new Error("no such room"), { status: 404 });
-  if (body.memberIds !== undefined && phoneSecretSubmissions.hasGroup(existing.id)) {
-    throw Object.assign(new Error("this channel is securely saving a credential — try again when it finishes"), { status: 409 });
-  }
-  if (
-    channelTaskBlocked(existing) &&
-    (body.memberIds !== undefined || body.defaultResponder !== undefined || body.bulletin !== undefined)
-  ) {
-    throw Object.assign(new Error("this channel is working or waiting on you — finish that turn first"), { status: 409 });
-  }
   const patch: Record<string, unknown> = {};
+  if (Object.hasOwn(body, "yolo")) {
+    if (body.yolo === null) {
+      patch.yolo = undefined;
+    } else {
+      const parsed = parseGroupYoloPolicy(body.yolo);
+      if (!parsed.ok) throw Object.assign(new Error(parsed.error), { status: 400 });
+      const workspace = validateBotCwd(parsed.policy.workspace);
+      if (!workspace.ok || !workspace.cwd) throw Object.assign(new Error(workspace.ok ? "YOLO workspace must be an existing folder" : workspace.error), { status: 400 });
+      if (existing.dm || existing.installedPackage) throw Object.assign(new Error("YOLO is available only for user-created channels"), { status: 400 });
+      patch.yolo = { ...parsed.policy, workspace: realpathSync(workspace.cwd) };
+    }
+  }
   if (body.name !== undefined) {
     if (typeof body.name !== "string") throw Object.assign(new Error("room name must be a string"), { status: 400 });
     const name = body.name.trim();

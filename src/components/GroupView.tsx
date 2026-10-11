@@ -4,7 +4,7 @@
 // default responder; @mentions override that routing.
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { activeLocale, t } from "@/lib/i18n";
-import { ArrowDown, Check, ChevronDown, ChevronRight, Folder, FolderOpen, Loader2, MessageSquareReply, Pin, PinOff, Plus, Search, X } from "lucide-react";
+import { ArrowDown, Check, ChevronDown, ChevronRight, Folder, FolderOpen, Loader2, MessageSquareReply, Pin, PinOff, Plus, Search, Square, X } from "lucide-react";
 import {
   api,
   useStore,
@@ -15,6 +15,8 @@ import {
   type GroupDefaultResponder,
   type Message,
 } from "@/state/store";
+import type { GroupYoloPolicy, YoloToolCategory } from "../../shared/wire";
+import type { LocaleKey } from "@/locales";
 import { BotAvatar } from "./Avatar";
 import { PlaceIcon } from "./PlaceIcon";
 import { ScreenFrame } from "./ScreenFrame";
@@ -730,6 +732,426 @@ function RoomWorkingFolderChip({ group, onToggle }: { group: Group; onToggle: ()
     </button>
   );
 }
+/** The store type today omits the persisted `yolo` field the wire already
+ * carries, so this file reads it structurally. Missing means Ask — YOLO is
+ * active only if a policy is set. */
+type GroupWithYolo = Group & { yolo?: GroupYoloPolicy };
+
+const YOLO_TOOL_CATEGORIES: YoloToolCategory[] = ["shell", "files", "web", "integrations"];
+const YOLO_EXTERNAL_KEYS = ["communications", "publishing", "payments", "production"] as const;
+type YoloExternalKey = (typeof YOLO_EXTERNAL_KEYS)[number];
+const YOLO_MAX_ACTIONS = 1_000;
+const YOLO_MAX_MINUTES = 480;
+
+/** YOLO chip for the room header: explicit, owner-driven, never derived from
+ * transcript content. Ask reads as plain text; active reads as a visible
+ * warning pill. No remote-client/DM/setup rendering — GroupView gates that. */
+export function RoomYoloChip({ group, open, onToggle }: { group: Group; open: boolean; onToggle: () => void }) {
+  const yolo = (group as GroupWithYolo).yolo;
+  if (yolo) {
+    return (
+      <button
+        type="button"
+        data-testid="room-yolo-chip"
+        onClick={onToggle}
+        aria-pressed={open}
+        title={t("room.yolo.activeChip")}
+        className="flex shrink-0 items-center gap-1.5 rounded-full border border-danger/40 bg-danger/10 px-2.5 py-1 text-[12.5px] font-semibold text-danger hover:bg-danger/15"
+      >
+        <span aria-hidden="true" className="size-1.5 rounded-full bg-danger" />
+        {t("room.yolo.active")}
+      </button>
+    );
+  }
+  return (
+    <button
+      type="button"
+      data-testid="room-yolo-chip"
+      onClick={onToggle}
+      aria-pressed={open}
+      title={t("room.yolo.askChip")}
+      className="shrink-0 rounded-full border border-hairline/40 bg-raised/60 px-2.5 py-1 text-[12.5px] font-medium text-ink-secondary hover:bg-raised hover:text-ink"
+    >
+      {t("room.yolo.ask")}
+    </button>
+  );
+}
+
+function parseSlugList(raw: string): { slugs: string[]; ok: boolean } {
+  const slugs = [...new Set(
+    raw.split(",").map((entry) => entry.trim().toLowerCase()).filter(Boolean),
+  )];
+  const ok = slugs.length <= 64 && slugs.every((entry) => /^[a-z][a-z0-9_-]{0,31}$/.test(entry));
+  return { slugs, ok };
+}
+
+function parseOptionalLimit(raw: string, max: number): { value?: number; ok: boolean } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { value: undefined, ok: true };
+  if (!/^\d+$/.test(trimmed)) return { value: undefined, ok: false };
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value) || value < 1 || value > max) return { value: undefined, ok: false };
+  return { value, ok: true };
+}
+
+/** Owner review + activation surface for channel YOLO. The approved folder is
+ * the room's selected folder (read-only here; RoomWorkingFolder owns edits)
+ * because all YOLO execution is pinned there. Activation shows exactly one
+ * informative confirmation before the single PATCH that persists the policy;
+ * deactivation PATCHes null immediately with no confirmation step. */
+export function RoomYoloPanel({ group, onEditFolder }: { group: Group; onEditFolder: () => void }) {
+  const { dispatch } = useStore();
+  const saved = (group as GroupWithYolo).yolo;
+  const folder = group.pinnedCwd === undefined ? group.cwd : (group.pinnedCwd ?? undefined);
+  const [tools, setTools] = useState<YoloToolCategory[]>(saved?.allowedTools ?? []);
+  const [integrationsDraft, setIntegrationsDraft] = useState((saved?.allowedIntegrations ?? []).join(", "));
+  const [externalWrites, setExternalWrites] = useState<Record<YoloExternalKey, boolean>>(
+    saved?.externalWrites ?? { communications: false, publishing: false, payments: false, production: false },
+  );
+  const [maxActionsDraft, setMaxActionsDraft] = useState(saved?.maxActions != null ? String(saved.maxActions) : "");
+  const [maxMinutesDraft, setMaxMinutesDraft] = useState(saved?.maxMinutes != null ? String(saved.maxMinutes) : "");
+  const [confirming, setConfirming] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // A newly saved policy arrives on the same group object; keep the review in
+  // sync without clobbering mid-edit drafts on unrelated renders.
+  const savedKey = saved
+    ? `${saved.workspace}|${[...saved.allowedTools].sort().join(",")}|${[...saved.allowedIntegrations].sort().join(",")}|${YOLO_EXTERNAL_KEYS.map((key) => saved.externalWrites[key] ? "1" : "0").join("")}|${saved.maxActions ?? ""}|${saved.maxMinutes ?? ""}|${saved.activatedAt}`
+    : "";
+  useEffect(() => {
+    if (saving || confirming) return;
+    setTools(saved?.allowedTools ?? []);
+    setIntegrationsDraft((saved?.allowedIntegrations ?? []).join(", "));
+    setExternalWrites(saved?.externalWrites ?? { communications: false, publishing: false, payments: false, production: false });
+    setMaxActionsDraft(saved?.maxActions != null ? String(saved.maxActions) : "");
+    setMaxMinutesDraft(saved?.maxMinutes != null ? String(saved.maxMinutes) : "");
+  }, [savedKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const { slugs, ok: slugsOk } = parseSlugList(integrationsDraft);
+  const maxActions = parseOptionalLimit(maxActionsDraft, YOLO_MAX_ACTIONS);
+  const maxMinutes = parseOptionalLimit(maxMinutesDraft, YOLO_MAX_MINUTES);
+  const folderChanged = Boolean(saved && folder && saved.workspace !== folder);
+
+  const toggleTool = (category: YoloToolCategory) =>
+    setTools((current) => current.includes(category) ? current.filter((entry) => entry !== category) : [...current, category]);
+  const toggleExternal = (key: YoloExternalKey) =>
+    setExternalWrites((current) => ({ ...current, [key]: !current[key] }));
+
+  const persist = async (yolo: GroupYoloPolicy | null) => {
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await api<{ group?: Partial<GroupWithYolo> & { id: string } }>(`/api/groups/${group.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ yolo }),
+      });
+      if (result?.group) dispatch({ type: "groupPatched", group: result.group });
+      else dispatch({ type: "groupPatched", group: { id: group.id, yolo: yolo ?? undefined } as Partial<Group> & { id: string } });
+      setConfirming(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const requestEnable = () => {
+    setError(null);
+    if (!folder) {
+      setError(t("room.yolo.noWorkspace"));
+      return;
+    }
+    if (!slugsOk) {
+      setError(t("room.yolo.invalidIntegrations"));
+      return;
+    }
+    if (!maxActions.ok) {
+      setError(t("room.yolo.invalidMaxActions"));
+      return;
+    }
+    if (!maxMinutes.ok) {
+      setError(t("room.yolo.invalidMaxMinutes"));
+      return;
+    }
+    // Exactly one informative confirmation before saving the policy.
+    setConfirming(true);
+  };
+
+  const confirmEnable = () => {
+    if (!folder) {
+      setError(t("room.yolo.noWorkspace"));
+      setConfirming(false);
+      return;
+    }
+    void persist({
+      mode: "yolo",
+      workspace: folder,
+      allowedTools: [...tools],
+      allowedIntegrations: slugs,
+      externalWrites: { ...externalWrites },
+      ...(maxActions.value === undefined ? {} : { maxActions: maxActions.value }),
+      ...(maxMinutes.value === undefined ? {} : { maxMinutes: maxMinutes.value }),
+      activatedAt: Date.now(),
+    });
+  };
+
+  const disable = () => {
+    setConfirming(false);
+    void persist(null);
+  };
+
+  const toolSummaryText = tools.length === 0
+    ? t("room.yolo.none")
+    : tools.map((category) => t(`room.yolo.tool.${category}` as LocaleKey)).join(", ");
+  const externalOn = YOLO_EXTERNAL_KEYS.filter((key) => externalWrites[key]);
+  const externalSummaryText = externalOn.length === 0
+    ? t("room.yolo.none")
+    : externalOn.map((key) => t(`room.yolo.external.${key}` as LocaleKey)).join(", ");
+  const limitsSummaryText = maxActions.value == null && maxMinutes.value == null
+    ? t("room.yolo.noCaps")
+    : [`${maxActionsDraft.trim()}`, `${maxMinutesDraft.trim()}`].filter((entry) => entry !== "").join(" · ");
+
+  return (
+    <section aria-labelledby="room-yolo-title" className="rounded-xl bg-card p-4">
+      <div className="text-[15px] font-medium text-ink" id="room-yolo-title">{t("room.yolo.panelTitle")}</div>
+      {saved ? (
+        <p className="mt-0.5 text-[13px] text-ink-secondary">{t("room.yolo.activeSummary")}</p>
+      ) : (
+        <p className="mt-0.5 text-[13px] text-ink-secondary">{t("room.yolo.askNote")}</p>
+      )}
+
+      <div className="mt-3">
+        <div className="text-[13px] font-semibold text-ink">{t("room.yolo.workspaceLabel")}</div>
+        <div className="mt-1.5 flex items-center gap-2">
+          <div className="min-w-0 flex-1 truncate rounded-lg border border-hairline/40 bg-inset px-3 py-2 font-mono text-[12.5px] text-ink" title={folder}>
+            {folder ?? <span className="font-sans text-ink-secondary">{t("room.yolo.workspaceNone")}</span>}
+          </div>
+          <button
+            type="button"
+            onClick={onEditFolder}
+            className="shrink-0 rounded-lg bg-raised px-3 py-2 text-[13px] text-ink hover:bg-raised-hover"
+          >
+            {t("room.yolo.editFolder")}
+          </button>
+        </div>
+        {folderChanged && (
+          <p className="mt-2 text-[12px] text-danger">{t("room.yolo.folderChanged")}</p>
+        )}
+      </div>
+
+      <fieldset className="mt-3 block">
+        <legend className="text-[13px] font-semibold text-ink">{t("room.yolo.toolsLabel")}</legend>
+        <p className="mt-0.5 text-[12px] text-ink-secondary">{t("room.yolo.toolsHint")}</p>
+        <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
+          {YOLO_TOOL_CATEGORIES.map((category) => (
+            <label key={category} className="flex cursor-pointer items-center gap-2 rounded-lg border border-hairline/40 bg-inset/40 px-3 py-2 text-[13px] text-ink">
+              <input
+                type="checkbox"
+                checked={tools.includes(category)}
+                disabled={saving}
+                onChange={() => toggleTool(category)}
+                className="size-4 shrink-0 accent-accent"
+              />
+              {t(`room.yolo.tool.${category}` as LocaleKey)}
+            </label>
+          ))}
+        </div>
+      </fieldset>
+
+      <div className="mt-3">
+        <label htmlFor="room-yolo-integrations" className="text-[13px] font-semibold text-ink">{t("room.yolo.integrationsLabel")}</label>
+        <p className="mt-0.5 text-[12px] text-ink-secondary">{t("room.yolo.integrationsHint")}</p>
+        <input
+          id="room-yolo-integrations"
+          value={integrationsDraft}
+          onChange={(event) => setIntegrationsDraft(event.target.value)}
+          placeholder={t("room.yolo.integrationsPlaceholder")}
+          disabled={saving}
+          aria-invalid={!slugsOk}
+          className="mt-1.5 w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 font-mono text-[12.5px] text-ink placeholder:text-ink-secondary focus:outline-none"
+        />
+        {!slugsOk && <p className="mt-1 text-[12px] text-danger">{t("room.yolo.invalidIntegrations")}</p>}
+      </div>
+
+      <fieldset className="mt-3 block">
+        <legend className="text-[13px] font-semibold text-ink">{t("room.yolo.externalLabel")}</legend>
+        <p className="mt-0.5 text-[12px] text-ink-secondary">{t("room.yolo.externalHint")}</p>
+        <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
+          {YOLO_EXTERNAL_KEYS.map((key) => (
+            <label key={key} className="flex cursor-pointer items-start gap-2 rounded-lg border border-hairline/40 bg-inset/40 px-3 py-2">
+              <input
+                type="checkbox"
+                checked={externalWrites[key]}
+                disabled={saving}
+                onChange={() => toggleExternal(key)}
+                aria-describedby={`room-yolo-external-${key}-hint`}
+                className="mt-0.5 size-4 shrink-0 accent-accent"
+              />
+              <span>
+                <span className="block text-[13px] text-ink">{t(`room.yolo.external.${key}` as LocaleKey)}</span>
+                <span id={`room-yolo-external-${key}-hint`} className="mt-0.5 block text-[11.5px] text-ink-secondary">{t(`room.yolo.external.${key}Hint` as LocaleKey)}</span>
+              </span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
+
+      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+        <div>
+          <label htmlFor="room-yolo-max-actions" className="text-[13px] font-semibold text-ink">{t("room.yolo.maxActions")}</label>
+          <input
+            id="room-yolo-max-actions"
+            type="number"
+            min={1}
+            max={YOLO_MAX_ACTIONS}
+            step={1}
+            inputMode="numeric"
+            value={maxActionsDraft}
+            onChange={(event) => setMaxActionsDraft(event.target.value)}
+            disabled={saving}
+            aria-invalid={!maxActions.ok}
+            className="mt-1.5 w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:outline-none"
+          />
+          {!maxActions.ok && <p className="mt-1 text-[12px] text-danger">{t("room.yolo.invalidMaxActions")}</p>}
+        </div>
+        <div>
+          <label htmlFor="room-yolo-max-minutes" className="text-[13px] font-semibold text-ink">{t("room.yolo.maxMinutes")}</label>
+          <input
+            id="room-yolo-max-minutes"
+            type="number"
+            min={1}
+            max={YOLO_MAX_MINUTES}
+            step={1}
+            inputMode="numeric"
+            value={maxMinutesDraft}
+            onChange={(event) => setMaxMinutesDraft(event.target.value)}
+            disabled={saving}
+            aria-invalid={!maxMinutes.ok}
+            className="mt-1.5 w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:outline-none"
+          />
+          {!maxMinutes.ok && <p className="mt-1 text-[12px] text-danger">{t("room.yolo.invalidMaxMinutes")}</p>}
+        </div>
+        <p className="text-[12px] text-ink-secondary sm:col-span-2">{t("room.yolo.limitsLabel")}: {t("room.yolo.limitsHint")}</p>
+      </div>
+
+      <p className="mt-3 text-[12px] leading-relaxed text-ink-secondary">{t("room.yolo.scopeNote")}</p>
+
+      {error && <div role="alert" className="mt-3 rounded-xl border border-danger/30 bg-danger/10 px-3 py-2 text-[12.5px] text-danger">{error}</div>}
+
+      {confirming ? (
+        <div role="alertdialog" aria-labelledby="room-yolo-confirm-title" aria-describedby="room-yolo-confirm-note" className="mt-3 rounded-xl border border-danger/30 bg-danger/[0.06] p-3">
+          <div id="room-yolo-confirm-title" className="text-[13px] font-semibold text-ink">{t("room.yolo.confirmNote")}</div>
+          <dl id="room-yolo-confirm-note" className="mt-2 space-y-1 text-[12.5px] text-ink-secondary">
+            <div className="flex gap-2"><dt className="shrink-0 font-medium text-ink">{t("room.yolo.workspaceLabel")}:</dt><dd className="min-w-0 truncate font-mono">{folder}</dd></div>
+            <div className="flex gap-2"><dt className="shrink-0 font-medium text-ink">{t("room.yolo.toolsLabel")}:</dt><dd>{toolSummaryText}</dd></div>
+            <div className="flex gap-2"><dt className="shrink-0 font-medium text-ink">{t("room.yolo.integrationsLabel")}:</dt><dd className="font-mono">{slugs.length === 0 ? t("room.yolo.none") : slugs.join(", ")}</dd></div>
+            <div className="flex gap-2"><dt className="shrink-0 font-medium text-ink">{t("room.yolo.externalLabel")}:</dt><dd>{externalSummaryText}</dd></div>
+            <div className="flex gap-2"><dt className="shrink-0 font-medium text-ink">{t("room.yolo.limitsLabel")}:</dt><dd>{limitsSummaryText}</dd></div>
+          </dl>
+          <div className="mt-3 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={confirmEnable}
+              disabled={saving}
+              className="rounded-lg bg-danger px-3 py-2 text-[13px] font-semibold text-white hover:brightness-110 disabled:opacity-50"
+            >
+              {saving ? t("room.yolo.saving") : t("room.yolo.confirm")}
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirming(false)}
+              disabled={saving}
+              className="rounded-lg px-3 py-2 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
+            >
+              {t("common.cancel")}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          {saved ? (
+            <>
+              <button
+                type="button"
+                onClick={requestEnable}
+                disabled={saving}
+                className="rounded-lg bg-raised px-3 py-2 text-[13px] font-medium text-ink hover:bg-raised-hover disabled:opacity-50"
+              >
+                {saving ? t("room.yolo.saving") : t("room.yolo.saveChanges")}
+              </button>
+              <button
+                type="button"
+                onClick={disable}
+                disabled={saving}
+                className="rounded-lg px-3 py-2 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-50"
+              >
+                {t("room.yolo.disable")}
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={requestEnable}
+              disabled={saving}
+              className="rounded-lg bg-danger px-3 py-2 text-[13px] font-semibold text-white hover:brightness-110 disabled:opacity-50"
+            >
+              {saving ? t("room.yolo.saving") : t("room.yolo.enable")}
+            </button>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** Visible stop for a running room turn: POSTs the existing interrupt
+ * endpoint with exactly this conversation's threadId, then surfaces any
+ * failure inline. Rendered only while the room is working. */
+export function RoomStopButton({ group }: { group: Group }) {
+  const [stopping, setStopping] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!group.working) {
+      setStopping(false);
+      setError(null);
+    }
+  }, [group.working, group.threadId]);
+  if (!group.working) return null;
+  const stop = async () => {
+    setStopping(true);
+    setError(null);
+    try {
+      await api(`/api/groups/${group.id}/interrupt`, {
+        method: "POST",
+        body: JSON.stringify({ threadId: group.threadId }),
+      });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setStopping(false);
+      return;
+    }
+    // The server's turn-settled broadcast clears `working`; until then the
+    // button stays busy so a second press cannot stack interrupts.
+  };
+  return (
+    <span className="flex shrink-0 items-center gap-1.5">
+      <button
+        type="button"
+        data-testid="room-stop-execution"
+        onClick={() => void stop()}
+        disabled={stopping}
+        title={t("room.yolo.stopTitle")}
+        aria-label={t("room.yolo.stopTitle")}
+        className="flex items-center gap-1.5 rounded-full border border-hairline/40 bg-raised/60 px-2.5 py-1 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-60"
+      >
+        <Square size={12} className="fill-current" aria-hidden="true" />
+        {stopping ? t("room.yolo.saving") : t("room.yolo.stopExecution")}
+      </button>
+      {error && <span role="alert" className="max-w-[220px] truncate text-[12px] text-danger" title={error}>{error}</span>}
+    </span>
+  );
+}
 
 
 type RoomSetupFields = {
@@ -1130,6 +1552,7 @@ export function GroupView({ group }: { group: Group }) {
   const [bulletinDraft, setBulletinDraft] = useState(group.bulletin);
   const [folderOpen, setFolderOpen] = useState(false);
   const [membersOpen, setMembersOpen] = useState(false);
+  const [yoloOpen, setYoloOpen] = useState(false);
   const [findOpen, setFindOpen] = useState(false);
   const { replyTo, selectReply, clearReply, consumeReply, restoreReply } = useReplyDraft(
     group.threadId,
@@ -1245,6 +1668,8 @@ export function GroupView({ group }: { group: Group }) {
   // an open folder editor belongs to the room it was opened in
   useEffect(() => setFolderOpen(false), [group.id]);
   useEffect(() => setMembersOpen(false), [group.id]);
+  // an open YOLO review belongs to the room it was opened in
+  useEffect(() => setYoloOpen(false), [group.id]);
   const saveBulletin = () => {
     setBulletinOpen(false);
     if (bulletinDraft !== group.bulletin) {
@@ -1351,7 +1776,9 @@ export function GroupView({ group }: { group: Group }) {
           {!setupPending && <ConversationTurnLimit group={group} />}
           <GroupCallButton group={group} members={members} />
           <GroupUsageChip usage={group.usage} />
+          {!remoteClient && !setupPending && !group.dm && <RoomStopButton group={group} />}
           {!remoteClient && !setupPending && !group.dm && <RoomWorkingFolderChip group={group} onToggle={() => setFolderOpen((open) => !open)} />}
+          {!remoteClient && !setupPending && !group.dm && <RoomYoloChip group={group} open={yoloOpen} onToggle={() => setYoloOpen((open) => !open)} />}
           {!remoteClient && !setupPending && !group.dm && <DefaultResponderSelect group={group} members={members} />}
           {group.dm || remoteClient ? (
             memberMauses
@@ -1441,6 +1868,14 @@ export function GroupView({ group }: { group: Group }) {
         <div className="w-full px-5">
           <div className="mb-1">
             <RoomWorkingFolder group={group} />
+          </div>
+        </div>
+      )}
+      {/* YOLO review panel — the YOLO chip in the header toggles it */}
+      {!setupPending && yoloOpen && !remoteClient && !group.dm && (
+        <div className="w-full px-5">
+          <div className="mb-1">
+            <RoomYoloPanel key={group.id} group={group} onEditFolder={() => setFolderOpen(true)} />
           </div>
         </div>
       )}

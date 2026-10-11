@@ -7,7 +7,7 @@
 
 import type { ApprovalMode } from "../shared/approval-mode.ts";
 import type { ToolScope } from "../shared/tool-scope.ts";
-import type { EffortLevel } from "../shared/wire.ts";
+import type { EffortLevel, GroupYoloPolicy, YoloToolCategory } from "../shared/wire.ts";
 import type {
   DriverKind, InstanceId, ModelVariantOption, RuntimeEventListener, ThreadId, TurnId,
 } from "../shared/runtime-events.ts";
@@ -107,16 +107,24 @@ export type RequestOutcome = "allowed-once" | "rejected" | "answered" | "unavail
 // ── adapter contract (upstream ProviderAdapterShape, promise-flavored) ──
 // The conversation runtime every provider is flattened into. streamEvents
 // becomes onEvent(listener) → unsubscribe; sessions start implicitly on
-// the first turn (the agentcal per-turn-process model) with resumeCursor
+/** Authorization copied from one channel only for its current execution. */
+export interface GroupYoloTurnScope {
+  groupId: string;
+  threadId: string;
+  botId: string;
+  executionId: string;
+  policy: GroupYoloPolicy;
+}
+
 // carrying the provider-native continuation (e.g. a claude session id).
 export interface SendTurnInput {
   threadId: ThreadId;
   /** The bot this turn belongs to. threadIds are meant to be unique per bot
    * task, but a driver's process-level resource maps (permission-broker
-   * socket, CLI session) key off threadId alone — botId lets a driver namespace
-   * those resources so a threadId that unexpectedly coincides across two
-   * bots (e.g. a delegation still holding its own broker open) can never
-   * collide with another bot's live session or broker (see #1017). */
+   * socket, CLI session) key off threadId alone — botId lets a driver
+   * namespace those resources so a threadId that unexpectedly coincides
+   * across two bots (e.g. a delegation still holding its own broker open)
+   * can never collide with another bot's live session or broker (see #1017). */
   botId?: string;
   text: string;
   /** Per-bot approval policy, reasserted by providers on every turn so a
@@ -124,6 +132,9 @@ export interface SendTurnInput {
   approvalMode?: ApprovalMode;
   /** Fresh owner selection, independent of execution approval and resume state. */
   toolScope?: ToolScope;
+  /** Group-only authorization; never a bot default or a persisted driver grant. */
+  /** A native driver must confine shell and file tools to this exact workspace. */
+  groupYolo?: GroupYoloTurnScope;
   /** A guest drives this turn on an OMB Cloud home: it runs with no shell
    * or command execution and reads nothing outside its own folder. Sent
    * only to a driver whose capabilities.guestTurns is "confined"; the harness
@@ -332,6 +343,8 @@ export interface ProviderAdapter {
      * execution, no reads outside its folder). Absent: such a turn is
      * refused. */
     guestTurns?: "confined";
+    /** Native sandbox bounds shell/file access to the exact authorized workspace. */
+    groupYolo?: "confined-workspace";
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;

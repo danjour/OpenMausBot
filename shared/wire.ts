@@ -679,6 +679,20 @@ export interface GroupTask {
   titleFromFirstMessage?: true;
 }
 
+export type YoloToolCategory = "shell" | "files" | "web" | "integrations";
+
+/** Persisted, owner-confirmed authorization for one channel. Missing means Ask. */
+export interface GroupYoloPolicy {
+  mode: "yolo";
+  workspace: string;
+  allowedTools: YoloToolCategory[];
+  allowedIntegrations: string[];
+  externalWrites: { communications: boolean; publishing: boolean; payments: boolean; production: boolean };
+  maxActions?: number;
+  maxMinutes?: number;
+  activatedAt: number;
+}
+
 /** A room as a client may see it: the record plus the computed working
  * flag (publicGroupState). */
 export interface WireGroup {
@@ -713,6 +727,9 @@ export interface WireGroup {
   pinnedCwd?: string | null;
   /** Compatibility mirror of the active task's pinned message. */
   pinnedMessageId?: string;
+  /** Missing means Ask. A channel-local policy never follows its bots elsewhere. */
+  yolo?: GroupYoloPolicy;
+
   /** sidebar section heading this room is filed under. */
   section?: string;
   /** New user-created rooms start with setup pending. */

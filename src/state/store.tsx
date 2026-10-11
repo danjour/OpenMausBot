@@ -13,7 +13,7 @@ import {
   type ReactNode,
 } from "react";
 import { flushSync } from "react-dom";
-import type { BotVisibility, CardAnswerer, CloudBackend, ConnectorToolGrant, EffortLevel, InstalledPackageMetadata, LiveCallState, LiveSettings, ServerFrame, GroupThreadUsage, SteerQueueReason } from "../../shared/wire";
+import type { BotVisibility, CardAnswerer, CloudBackend, ConnectorToolGrant, EffortLevel, GroupYoloPolicy, InstalledPackageMetadata, LiveCallState, LiveSettings, ServerFrame, GroupThreadUsage, SteerQueueReason } from "../../shared/wire";
 import { DATA_ROUTES, type DataSheet, type DataTable } from "../../shared/data-surface";
 import type { TurnDigest } from "../../shared/digest";
 import type { ToolScope } from "../../shared/tool-scope";
@@ -273,6 +273,8 @@ export interface Group {
   pinnedCwd?: string | null;
   /** the one message pinned to the top of this room's transcript */
   pinnedMessageId?: string;
+  /** Channel-local authorization; absent means Ask. */
+  yolo?: GroupYoloPolicy;
   /** sidebar section heading this room is filed under (shared with bots) */
   section?: string;
   /** New user-created rooms remain in setup until Save or Skip. */
